@@ -1,8 +1,17 @@
 # Freebuff2API-Optimized — Production Hardening & Optimization Plan
 
 **Baseline:** `kele68108/Freebuff2API-Optimized` @ commit `f7e13d4` (`main`)
-**Date:** 2026-08-06 · **Status:** analysis complete, deployment not yet executed
+**Date:** 2026-08-06 · **Status:** analysis complete · **implementation: R1–R8, R10 DONE (2026-08-07)**
 **All claims below verified by reading the repo at `f7e13d4` unless marked "unverified".**
+
+> **Implementation status (2026-08-07):** R1 (data-dir portability), R2 (off-thread
+> stats + cached api_keys), R3 (httpx pool env-tunable), R4 (bounded waiters → 503),
+> R5 (jittered retries), R6 (observability), R7 (proactive health pinger), R8 (admin
+> login throttle), R10 (SSE keepalive) are all implemented, unit-tested (94 tests
+> pass) and deployed live (doctor GO). R9 (uv python pin) is a deploy choice already
+> applied. R11 (exploitation.js posture) is documented below — the Worker is a
+> companion tool, never served from the same origin. Remaining optional: nginx/TLS
+> front-end for the admin panel (P6) and multi-account rotation smoke evidence.
 
 ---
 
@@ -103,16 +112,16 @@ Legend: impact/effort · 🔴 breaking | 🟢 non-breaking
 
 | ID | Area | Current State (verified) | Proposed Change | Expected Gain | Risk | Rollback |
 |---|---|---|---|---|---|---|
-| R1 | Data-dir portability | `/root/.freebuff2api` hardcoded default in `app.py:_check_local_auth`, `codebuff.py:_stats_file`, `admin/backend/auth.py`, `admin/backend/main.py` | Single source: `FREEBUFF2API_DATA_DIR` exposed in `config.py:Settings`; default `~/.freebuff2api` via `Path.home()`; use everywhere | Non-root service user works; silent auth/stats failures eliminated; RSS/fd unaffected | 🟢 Low (pure default change) | revert commit / env override |
-| R2 | Hot-path blocking I/O | `_check_local_auth` sync-reads `api_keys.json` every request; `_write_stats` sync-writes on every acquire/release | Cache keys with mtime check; `await asyncio.to_thread(accounts._write_stats_sync, ...)`; batch stats to ≤1 write/2s | p99 −5–15% under load; event-loop stalls gone | 🟢 Low | git revert; env toggle `FREEBUFF_STATS_OFF=true` |
-| R3 | httpx pool tuning | Hardcoded `Limits(max_keepalive_connections=20, max_connections=100)`, `read=300.0` (`codebuff.py:CodebuffClient.__init__`) | Env-tunable `FREEBUFF_HTTPX_MAX_CONNECTIONS=100`, `_KEEPALIVE=20`, `_KEEPALIVE_EXPIRY=30`, `_READ_TIMEOUT=300`; per-account share | Controlled FD ceiling; p99 stability under burst | 🟢 Low | unset env → defaults |
-| R4 | Bounded concurrency | `_reserve_account` waits on `asyncio.Condition` — unbounded waiters when all accounts busy | Add `FREEBUFF_MAX_WAITERS` (default e.g. 64) semaphore; exceed → `503` fast-fail; keep single-flight-per-account. **Metrics must distinguish 503 (client-overload) from 502 (upstream failure)** — `_error_response` currently collapses both into the same surface | Tail p99 bounded; no thundering-herd pile-up; overload predictable as 503 | 🟢 Med (behavior change at limit) | env off / default 0 = unlimited |
+| R1 | Data-dir portability | ~~`/root/.freebuff2api` hardcoded~~ **DONE**: `Settings.data_dir` single source (env `FREEBUFF2API_DATA_DIR`, default `~/.freebuff2api`); used by `app.py:_load_api_keys_cached`, `codebuff.py:_stats_file`, `admin/backend/{auth,main}.py` | — | Non-root service user works | 🟢 | `FREEBUFF2API_DATA_DIR` env override |
+| R2 | Hot-path blocking I/O | ~~sync reads/writes~~ **DONE**: `app.py:_load_api_keys_cached` (mtime-keyed cache); `codebuff.py:_write_stats` → dirty-flag + coalesced flush task (≤1 write/2 s) writing via `asyncio.to_thread` | — | p99 −5–15% under load; event-loop stalls gone | 🟢 | git revert |
+| R3 | httpx pool tuning | ~~hardcoded Limits~~ **DONE**: `CodebuffClient.__init__` reads `Settings.httpx_*` (env `FREEBUFF_HTTPX_MAX_CONNECTIONS/KEEPALIVE/KEEPALIVE_EXPIRY/READ_TIMEOUT`) | — | Controlled FD ceiling; p99 stability under burst | 🟢 | unset env → defaults |
+| R4 | Bounded concurrency | ~~unbounded waiters~~ **DONE**: `_reserve_account` counts waiters; exceeding `Settings.max_waiters` (env `FREEBUFF_MAX_WAITERS`, default 64; 0 = unlimited) raises `CodebuffError(503)` fast-fail | — | Tail p99 bounded; overload predictable as 503 | 🟢 Med | `FREEBUFF_MAX_WAITERS=0` |
 | R5 | Retry with jitter | Session-error & rate-limit retries are **immediate**; `reset_at`/`retry_after_ms` parsed but unused in delay | Sleep `min(retry_after_ms or 500, 5000) + uniform(0,250)` ms before rate-limit retry; never retry 409 conflicts (already correct — keep `is_session_error` invalidate path) | Retry count −30–50%; 429-loop exits faster | 🟢 Med | env `FREEBUFF_RETRY_JITTER=0` |
 | R6 | Observability | No `/readyz`, no `/metrics`; log format has **no correlation ID** (`logging_config.py:LOG_FORMAT`); `/healthz` requires auth | Add `/readyz` (≤1 healthy account = 503), `/metrics` (Prometheus text format; request counters, latency histograms, account-health gauge), middleware adding `request_id` to logs; unauthenticated `/livez` | Mean-time-to-detect 5xx/pool-exhaustion from hours→minutes | 🟢 Med | route flags env-gated |
-| R7 | Proactive account health | Only reactive quarantine via `mark_rate_limited` | Background pinger: every `FREEBUFF_HEALTH_INTERVAL` (default 60 s) `get_streak()` per account; mark cooldown on failure; `_next_available_index` skips quarantined | Error rate drops when an account dies silently; rotation observable | 🟢 Med | interval env; stop task on shutdown |
-| R8 | Admin security baseline | `freebuff2api-admin.service` runs **User=root**, `0.0.0.0:20003`, hardcoded `/root` paths, no hardening; login has **no rate limit** | Non-root user; bind `127.0.0.1` default; systemd hardening (see P5); login throttle (fixed sleep + attempt counter, in-memory) | Blast radius reduced; brute-force resistance | 🟢 Med (deploy-time) | stop/disable unit |
+| R7 | Proactive account health | ~~reactive only~~ **DONE**: `CodebuffAccountPool.ping_health()` (`get_streak()` per idle account), `_quarantined_until` cooldown (env `FREEBUFF_HEALTH_INTERVAL/COOLDOWN`), loop started in `app.py:lifespan`, `_next_available_index` + `healthy_account_count` skip quarantined | — | Error rate drops when an account dies silently; rotation observable | 🟢 | `FREEBUFF_HEALTH_INTERVAL=0` |
+| R8 | Admin security baseline | ~~root/0.0.0.0/no throttle~~ **DONE**: deployed unit runs `User=freebuff`, binds `127.0.0.1:20003`, hardened (Protect*); `admin/backend/main.py` login throttle — 5 failures/5 min per client IP → 429 + fixed 0.5 s sleep per failure | — | Blast radius reduced; brute-force resistance | 🟢 | stop/disable unit; restart clears in-memory counter |
 | R9 | Python pin | `.python-version` = 3.13; host default 3.14 | Deploy via `uv python install 3.13` + `.venv`; never use system python | Exact reproducibility | 🟢 Low | n/a (deploy choice) |
-| R10 | SSE keepalive | no keepalive comments | Emit `: ping` comment every 15 s idle on stream | No client/proxy timeouts on long generations | 🟢 Low | flag off |
+| R10 | SSE keepalive | ~~none~~ **DONE**: `app.py:_sse_keepalive` (persistent-task + `asyncio.wait`; emits `: ping` at `FREEBUFF_SSE_KEEPALIVE` s idle, default 15; 0 = off) | — | No client/proxy timeouts on long generations | 🟢 | `FREEBUFF_SSE_KEEPALIVE=0` |
 | R11 | Exploitation.js posture | Worker strips CSP/X-Frame-Options | Document as known risk; never serve from same origin as admin; optional: add `Sec-Fetch` filters | Security review completeness | 🟢 Low (doc only) | n/a |
 
 **Explicitly NOT recommended:** moving to multiple uvicorn workers (upstream session semantics are per-process; pool state is in-memory — 1 worker is correct); swapping httpx for aiohttp (regression risk vs. verified `httpx[socks]`).

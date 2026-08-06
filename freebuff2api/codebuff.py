@@ -98,14 +98,25 @@ class FreebuffSessionLease:
 class RateLimitState:
     blocked_models: dict[str, float] = field(default_factory=dict)
     last_error_at: float | None = None
+    # R7: set by the proactive health pinger when get_streak fails; the account
+    # is skipped until this instant passes (cooldown, default 300 s).
+    quarantined_until: float | None = None
 
 
 class CodebuffClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        # R3: httpx pool limits are env-tunable (FREEBUFF_HTTPX_*).
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(settings.request_timeout, read=300.0),
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+            timeout=httpx.Timeout(
+                settings.request_timeout,
+                read=settings.httpx_read_timeout,
+            ),
+            limits=httpx.Limits(
+                max_keepalive_connections=settings.httpx_max_keepalive,
+                max_connections=settings.httpx_max_connections,
+                keepalive_expiry=settings.httpx_keepalive_expiry,
+            ),
             follow_redirects=True,
             proxy=settings.upstream_proxy_url,
             trust_env=False,
@@ -857,13 +868,25 @@ class CodebuffAccountPool:
             )
         self._next_index = 0
         self._condition = asyncio.Condition()
-        self._stats_file = Path(os.getenv("FREEBUFF2API_DATA_DIR") or str(Path.home() / ".freebuff2api")) / "account_stats.json"
+        # R1: data dir is single-sourced from settings (env FREEBUFF2API_DATA_DIR,
+        # default ~/.freebuff2api) — never a hardcoded /root path.
+        self._stats_file = settings.data_dir / "account_stats.json"
         self._account_stats = [
             {"use_count": 0, "last_used_at": None, "last_model": None, "busy": False}
             for _ in self._accounts
         ]
         self._last_reserved_index = -1
         self._stats_lock = asyncio.Lock()
+        # R2: stats writes are coalesced to <=1 per 2 s and flushed off-thread;
+        # _stats_dirty marks pending changes, _stats_flush_task drains them.
+        self._stats_dirty = False
+        self._stats_flush_task: asyncio.Task[None] | None = None
+        # R4: bounded concurrency — number of requests currently blocked waiting
+        # for a free account. Exceeding settings.max_waiters fails fast with 503.
+        self._waiters = 0
+        self._max_waiters = settings.max_waiters
+        # R7: proactive health pinger cooldown.
+        self._health_cooldown = settings.health_cooldown
 
     @property
     def account_count(self) -> int:
@@ -874,6 +897,8 @@ class CodebuffAccountPool:
         now = time.time()
         count = 0
         for account in self._accounts:
+            if account.rate_limit.quarantined_until and account.rate_limit.quarantined_until > now:
+                continue
             blocked = any(
                 until > now
                 for until in account.rate_limit.blocked_models.values()
@@ -894,24 +919,94 @@ class CodebuffAccountPool:
         return self._accounts[0].sessions
 
     async def aclose(self) -> None:
+        # R2: cancel any pending coalesced stats flush, then do a final sync
+        # write so the last state is not lost.
+        if self._stats_flush_task is not None and not self._stats_flush_task.done():
+            self._stats_flush_task.cancel()
+            try:
+                await self._stats_flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._stats_dirty:
+            self._write_stats_sync(self._stats_snapshot())
         await asyncio.gather(
             *(account.client.aclose() for account in self._accounts),
             return_exceptions=True,
         )
 
+    def _stats_snapshot(self) -> dict[str, Any]:
+        return {
+            "account_count": len(self._accounts),
+            "last_reserved_index": self._last_reserved_index,
+            "accounts": self._account_stats,
+        }
+
+    def _write_stats_sync(self, data: dict[str, Any]) -> None:
+        try:
+            self._stats_file.parent.mkdir(parents=True, exist_ok=True)
+            self._stats_file.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            logger.debug("stats write failed", exc_info=True)
+
     async def _write_stats(self) -> None:
-        async with self._stats_lock:
-            data = {
-                "account_count": len(self._accounts),
-                "last_reserved_index": self._last_reserved_index,
-                "accounts": self._account_stats,
-            }
+        """R2: mark stats dirty and schedule a coalesced off-thread flush.
+
+        The event-loop hot path (acquire/release) never blocks on disk I/O:
+        _write_stats only flips a flag, and a single background task drains
+        changes at most once per 2 s via asyncio.to_thread.
+        """
+        self._stats_dirty = True
+        if self._stats_flush_task is None or self._stats_flush_task.done():
+            self._stats_flush_task = asyncio.create_task(self._stats_flush_loop())
+
+    async def _stats_flush_loop(self) -> None:
+        try:
+            while self._stats_dirty:
+                self._stats_dirty = False
+                await asyncio.sleep(2.0)
+                async with self._stats_lock:
+                    data = self._stats_snapshot()
+                await asyncio.to_thread(self._write_stats_sync, data)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("stats flush loop failed", exc_info=True)
+
+    async def ping_health(self) -> None:
+        """R7: one round of proactive per-account health checks.
+
+        A cheap get_streak() upstream call per idle account. Failure (dead
+        token, 401/403/429, network) quarantines the account for the cooldown
+        window; success clears any existing quarantine. This catches silently
+        dead accounts before chat traffic hits them.
+        """
+        now = time.time()
+        for index, account in enumerate(self._accounts):
+            if account.busy:
+                continue
             try:
-                self._stats_file.write_text(
-                    json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+                await account.client.get_streak()
+            except CodebuffError as error:
+                logger.warning(
+                    "health ping failed account_index=%s: %s",
+                    index,
+                    error,
                 )
+                account.rate_limit.quarantined_until = now + self._health_cooldown
+                account.rate_limit.last_error_at = now
             except Exception:
-                pass
+                logger.exception("health ping error account_index=%s", index)
+                account.rate_limit.quarantined_until = now + self._health_cooldown
+                account.rate_limit.last_error_at = now
+            else:
+                if account.rate_limit.quarantined_until is not None:
+                    logger.info(
+                        "health ping recovered account_index=%s",
+                        index,
+                    )
+                account.rate_limit.quarantined_until = None
 
     async def acquire_session(
         self,
@@ -979,6 +1074,7 @@ class CodebuffAccountPool:
         )
 
     async def _reserve_account(self, model: str) -> int:
+        max_waiters = self._max_waiters
         async with self._condition:
             while True:
                 account_index = self._next_available_index(model)
@@ -986,7 +1082,18 @@ class CodebuffAccountPool:
                     self._accounts[account_index].busy = True
                     self._next_index = (account_index + 1) % len(self._accounts)
                     return account_index
-                await self._condition.wait()
+                # R4: bounded concurrency — fail fast with 503 instead of piling
+                # up unbounded waiters when every account is busy.
+                if max_waiters and self._waiters >= max_waiters:
+                    raise CodebuffError(
+                        "too many concurrent requests waiting for an account",
+                        503,
+                    )
+                self._waiters += 1
+                try:
+                    await self._condition.wait()
+                finally:
+                    self._waiters -= 1
 
     def _next_available_index(self, model: str) -> int | None:
         account_count = len(self._accounts)
@@ -995,6 +1102,9 @@ class CodebuffAccountPool:
             account_index = (self._next_index + offset) % account_count
             account = self._accounts[account_index]
             if account.busy:
+                continue
+            # R7: skip accounts quarantined by the health pinger.
+            if account.rate_limit.quarantined_until and account.rate_limit.quarantined_until > now:
                 continue
             blocked_until = account.rate_limit.blocked_models.get(model)
             if blocked_until and now < blocked_until:

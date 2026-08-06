@@ -27,9 +27,50 @@ ADMIN_HOST = os.getenv("FREEBUFF2API_ADMIN_HOST", "0.0.0.0")
 SERVICE_NAME = os.getenv("FREEBUFF2API_SERVICE_NAME", "freebuff2api")
 ENV_PATH = str(config_manager._env_path())
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = Path(os.getenv("FREEBUFF2API_DATA_DIR", "/root/.freebuff2api"))
+# R1: data dir defaults to ~/.freebuff2api (never /root) so a non-root
+# service user works. Override with FREEBUFF2API_DATA_DIR.
+DATA_DIR = Path(os.getenv("FREEBUFF2API_DATA_DIR", str(Path.home() / ".freebuff2api")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 API_KEYS_FILE = DATA_DIR / "api_keys.json"
+
+# R8: in-memory login throttle — 5 failed attempts per 5 min window from the
+# same client IP get a 429, plus a fixed 0.5 s sleep on each failure to slow
+# brute force. In-memory only (single admin process is the deployment model).
+_LOGIN_MAX_FAILURES = 5
+_LOGIN_WINDOW_SECONDS = 300
+_LOGIN_FAIL_SLEEP_SECONDS = 0.5
+_login_failures: dict[str, list[float]] = {}
+_login_lock = asyncio.Lock()
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+async def _check_login_throttle(request: Request) -> None:
+    """R8: reject login attempts beyond the failure budget for this client."""
+    ip = _client_ip(request)
+    now = time.time()
+    async with _login_lock:
+        recent = [t for t in _login_failures.get(ip, []) if now - t < _LOGIN_WINDOW_SECONDS]
+        _login_failures[ip] = recent
+        if len(recent) >= _LOGIN_MAX_FAILURES:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed login attempts; try again later",
+            )
+
+
+async def _record_login_failure(request: Request) -> None:
+    ip = _client_ip(request)
+    now = time.time()
+    async with _login_lock:
+        _login_failures.setdefault(ip, []).append(now)
+    # fixed delay so an attacker cannot hammer the bcrypt check
+    await asyncio.sleep(_LOGIN_FAIL_SLEEP_SECONDS)
 
 # Frontend static dir
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -100,10 +141,15 @@ async def auth_setup(request: Request) -> dict[str, Any]:
 
 @app.post("/api/auth/login")
 async def auth_login(request: Request) -> dict[str, Any]:
+    await _check_login_throttle(request)
     body = await request.json()
     password = body.get("password", "")
     if not auth.verify_password(password):
+        await _record_login_failure(request)
         raise HTTPException(status_code=401, detail="Invalid password")
+    # successful login clears this client's failure history
+    async with _login_lock:
+        _login_failures.pop(_client_ip(request), None)
     return {"token": auth.create_token()}
 
 @app.post("/api/auth/change-password")

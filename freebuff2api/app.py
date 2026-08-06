@@ -105,6 +105,46 @@ def _rss_bytes() -> int:
     return 0
 
 
+# R2: cache of parsed api_keys.json keyed by file mtime, so the auth hot path
+# does not re-read + re-parse the file on every request.
+_api_keys_cache: tuple[float, list[dict[str, Any]]] | None = None
+
+
+def _load_api_keys_cached(data_dir: Path) -> list[dict[str, Any]]:
+    global _api_keys_cache
+    keys_file = data_dir / "api_keys.json"
+    try:
+        mtime = keys_file.stat().st_mtime
+    except OSError:
+        _api_keys_cache = None
+        return []
+    if _api_keys_cache is not None and _api_keys_cache[0] == mtime:
+        return _api_keys_cache[1]
+    try:
+        import json
+        with open(keys_file, "r", encoding="utf-8") as handle:
+            keys = json.load(handle)
+    except Exception:
+        keys = []
+    _api_keys_cache = (mtime, keys)
+    return keys
+
+
+async def _health_ping_loop(
+    accounts: CodebuffAccountPool,
+    interval: float,
+) -> None:
+    """R7: periodic proactive account health checks (best-effort)."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await accounts.ping_health()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("health ping loop error")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = load_settings()
@@ -116,9 +156,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.sessions = accounts.default_sessions
     app.state.metrics = Metrics()
     logger.info("configured freebuff accounts count=%s", accounts.account_count)
+    health_task: asyncio.Task[None] | None = None
+    if settings.health_interval > 0:
+        health_task = asyncio.create_task(
+            _health_ping_loop(accounts, settings.health_interval)
+        )
+        logger.info("account health pinger started interval=%ss", settings.health_interval)
     try:
         yield
     finally:
+        if health_task is not None:
+            health_task.cancel()
+            try:
+                await health_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await accounts.aclose()
 
 
@@ -216,19 +268,11 @@ def _check_local_auth(request: Request) -> None:
         if auth_header == expected:
             return
     
-    # multi-key from api_keys.json
-    import json, os
-    data_dir = Path(os.getenv("FREEBUFF2API_DATA_DIR", os.path.expanduser("~/.freebuff2api")))
-    keys_file = data_dir / "api_keys.json"
-    if keys_file.exists():
-        try:
-            with open(keys_file, "r", encoding="utf-8") as f:
-                keys = json.load(f)
-            for k in keys:
-                if k.get("enabled", True) and auth_header == f"Bearer {k.get('key', '')}":
-                    return
-        except Exception:
-            pass
+    # multi-key from api_keys.json (R1: data dir from settings; R2: cached by mtime)
+    keys = _load_api_keys_cached(settings.data_dir)
+    for k in keys:
+        if k.get("enabled", True) and auth_header == f"Bearer {k.get('key', '')}":
+            return
     
     raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -435,6 +479,38 @@ async def chat_completions(request: Request) -> Any:
     )
 
 
+async def _sse_keepalive(
+    lines: AsyncIterator[str],
+    idle_seconds: float,
+) -> AsyncIterator[str | None]:
+    """R10: emit a keepalive marker (None) when the upstream stream is idle.
+
+    Wraps the upstream line iterator with an idle deadline; if no line arrives
+    within idle_seconds, yields None so the caller can send a ": ping" SSE
+    comment. Prevents client/proxy timeouts on long generations.
+
+    IMPORTANT: uses a persistent task + asyncio.wait (NOT wait_for on
+    __anext__) — wait_for cancels the inner generator on timeout, which would
+    kill the live upstream stream. The read task survives timeouts and the
+    generator is only closed on StopAsyncIteration or outer cancellation.
+    """
+    next_task = asyncio.ensure_future(lines.__anext__())
+    try:
+        while True:
+            done, _ = await asyncio.wait({next_task}, timeout=idle_seconds)
+            if next_task not in done:
+                yield None
+                continue
+            try:
+                line = next_task.result()
+            except StopAsyncIteration:
+                return
+            next_task = asyncio.ensure_future(lines.__anext__())
+            yield line
+    finally:
+        next_task.cancel()
+
+
 async def _stream_openai_chunks(
     request: Request,
     payload: dict[str, Any],
@@ -447,8 +523,15 @@ async def _stream_openai_chunks(
     message_id: str | None = None
     client = client or (account_lease.client if account_lease else _client(request))
     settings = _settings(request)
+    upstream_lines = client.chat_events(payload)
+    if settings.sse_keepalive_seconds > 0:
+        upstream_lines = _sse_keepalive(upstream_lines, settings.sse_keepalive_seconds)
     try:
-        async for line in client.chat_events(payload):
+        async for line in upstream_lines:
+            if line is None:
+                # R10: idle keepalive comment — transparent to SSE parsers.
+                yield b": ping\n\n"
+                continue
             data = decode_sse_data(line)
             if data is None:
                 continue
