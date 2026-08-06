@@ -44,9 +44,13 @@ _login_lock = asyncio.Lock()
 
 
 def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    # Only trust X-Forwarded-For when a proxy is explicitly configured;
+    # otherwise an attacker reaching the admin can rotate the header to reset
+    # the failure budget. Direct clients use the TCP peer address.
+    if os.getenv("FREEBUFF2API_ADMIN_TRUST_PROXY", "false").lower() in ("1", "true", "yes", "on"):
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 
@@ -69,6 +73,23 @@ async def _record_login_failure(request: Request) -> None:
     now = time.time()
     async with _login_lock:
         _login_failures.setdefault(ip, []).append(now)
+        # Bound the dict IN PLACE (never reassign the module global): drop
+        # entries with no failures inside the window, and evict the oldest IPs
+        # if the dict ever exceeds a sane cap (memory DoS guard against
+        # spoofed-client spam).
+        for key in list(_login_failures):
+            _login_failures[key] = [
+                t for t in _login_failures[key] if now - t < _LOGIN_WINDOW_SECONDS
+            ]
+            if not _login_failures[key]:
+                del _login_failures[key]
+        if len(_login_failures) > 1000:
+            oldest = sorted(
+                _login_failures,
+                key=lambda k: _login_failures[k][-1],
+            )[:500]
+            for key in oldest:
+                del _login_failures[key]
     # fixed delay so an attacker cannot hammer the bcrypt check
     await asyncio.sleep(_LOGIN_FAIL_SLEEP_SECONDS)
 

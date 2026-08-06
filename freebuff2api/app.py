@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import json
 import logging
 from pathlib import Path
 import random
@@ -105,28 +106,30 @@ def _rss_bytes() -> int:
     return 0
 
 
-# R2: cache of parsed api_keys.json keyed by file mtime, so the auth hot path
-# does not re-read + re-parse the file on every request.
-_api_keys_cache: tuple[float, list[dict[str, Any]]] | None = None
+# R2: cache of parsed api_keys.json keyed by file mtime_ns, so the auth hot path
+# does not re-read + re-parse the file on every request. Nanosecond granularity
+# avoids serving a stale cache when the admin panel writes a new key and a client
+# calls with it within the same second (st_mtime tick would miss the change).
+_api_keys_cache: tuple[tuple[Path, int], list[dict[str, Any]]] | None = None
 
 
 def _load_api_keys_cached(data_dir: Path) -> list[dict[str, Any]]:
     global _api_keys_cache
     keys_file = data_dir / "api_keys.json"
     try:
-        mtime = keys_file.stat().st_mtime
+        mtime_ns = keys_file.stat().st_mtime_ns
     except OSError:
         _api_keys_cache = None
         return []
-    if _api_keys_cache is not None and _api_keys_cache[0] == mtime:
+    cache_key = (keys_file, mtime_ns)
+    if _api_keys_cache is not None and _api_keys_cache[0] == cache_key:
         return _api_keys_cache[1]
     try:
-        import json
         with open(keys_file, "r", encoding="utf-8") as handle:
             keys = json.load(handle)
     except Exception:
         keys = []
-    _api_keys_cache = (mtime, keys)
+    _api_keys_cache = (cache_key, keys)
     return keys
 
 
@@ -170,6 +173,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             try:
                 await health_task
             except (asyncio.CancelledError, Exception):
+                # awaiting a just-cancelled task raises CancelledError (a
+                # BaseException) — swallow it during shutdown.
                 pass
         await accounts.aclose()
 

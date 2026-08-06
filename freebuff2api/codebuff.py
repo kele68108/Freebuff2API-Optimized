@@ -926,6 +926,8 @@ class CodebuffAccountPool:
             try:
                 await self._stats_flush_task
             except (asyncio.CancelledError, Exception):
+                # CancelledError is a BaseException (not an Exception) but
+                # awaiting a just-cancelled task raises it — must swallow both.
                 pass
         if self._stats_dirty:
             self._write_stats_sync(self._stats_snapshot())
@@ -981,14 +983,21 @@ class CodebuffAccountPool:
         token, 401/403/429, network) quarantines the account for the cooldown
         window; success clears any existing quarantine. This catches silently
         dead accounts before chat traffic hits them.
+
+        Each check is bounded by wait_for so one hung account cannot stall the
+        whole round (get_streak inherits the client read timeout otherwise).
         """
         now = time.time()
+        per_account_timeout = min(max(self._health_cooldown, 5.0), 15.0)
         for index, account in enumerate(self._accounts):
             if account.busy:
                 continue
             try:
-                await account.client.get_streak()
-            except CodebuffError as error:
+                await asyncio.wait_for(
+                    account.client.get_streak(),
+                    timeout=per_account_timeout,
+                )
+            except (CodebuffError, asyncio.TimeoutError) as error:
                 logger.warning(
                     "health ping failed account_index=%s: %s",
                     index,
