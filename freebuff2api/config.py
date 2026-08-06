@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import uuid
 from dataclasses import dataclass
 
@@ -22,11 +23,14 @@ class Settings:
     codebuff_token: str | None
     local_api_key: str | None
     codebuff_base_url: str = "https://www.codebuff.com"
+    acting_user_id: str | None = None
+    cli_path: str = ""
     zeroclick_base_url: str = "https://zeroclick.dev"
     session_id: str = ""
     client_id: str = ""
     ad_providers: tuple[str, ...] = ("gravity", "zeroclick")
     request_timeout: float = 60.0
+    retry_jitter_ms: int = 250
     debug: bool = False
     log_level: str = "INFO"
     log_body_chars: int = 2000
@@ -98,11 +102,16 @@ def load_settings() -> Settings:
         codebuff_token=os.getenv("FREEBUFF_TOKEN") or os.getenv("CODEBUFF_TOKEN"),
         local_api_key=os.getenv("FREEBUFF_API_KEY") or os.getenv("OPENAI_API_KEY"),
         codebuff_base_url=_api_base_url(),
+        acting_user_id=os.getenv("FREEBUFF_ACTING_USER_ID") or None,
+        cli_path=os.getenv("FREEBUFF_CLI_PATH") or str(
+            Path.home() / ".config" / "manicode" / "freebuff"
+        ),
         zeroclick_base_url=os.getenv("ZEROCLICK_BASE_URL", "https://zeroclick.dev"),
         session_id=os.getenv("FREEBUFF_SESSION_ID", str(uuid.uuid4())),
         client_id=os.getenv("FREEBUFF_CLIENT_ID", uuid.uuid4().hex[:11]),
         ad_providers=_csv("FREEBUFF_AD_PROVIDERS", "gravity,zeroclick"),
         request_timeout=float(os.getenv("FREEBUFF_TIMEOUT", "60")),
+        retry_jitter_ms=_int("FREEBUFF_RETRY_JITTER", 250),
         debug=debug,
         log_level=log_level,
         log_body_chars=_int("FREEBUFF_LOG_BODY_CHARS", 0 if debug else 2000),

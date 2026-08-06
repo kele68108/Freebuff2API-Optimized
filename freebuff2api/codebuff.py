@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -22,9 +23,12 @@ logger = logging.getLogger("freebuff2api.codebuff")
 CODEBUFF_ACCEPT_ENCODING = "gzip, deflate"
 CODEBUFF_JSON_USER_AGENT = "Bun/1.3.11"
 FREEBUFF_CLI_USER_AGENT = "Freebuff-CLI/0.0.105"
+# Must match the exact signature the Freebuff CLI sends: the upstream
+# free_mode_cli_required gate fingerprints requests on this user-agent string.
+# Mirrors freebuff-go/client.go cliUserAgent (provider-utils/3.0.25).
 CHAT_COMPLETIONS_USER_AGENT = (
     "ai-sdk/openai-compatible/0.0.0-test/codebuff "
-    "ai-sdk/provider-utils/3.0.20 runtime/browser"
+    "ai-sdk/provider-utils/3.0.25 runtime/browser"
 )
 
 
@@ -484,9 +488,15 @@ class CodebuffClient:
 
     async def chat_events(self, payload: dict[str, Any]) -> AsyncIterator[str]:
         url = f"{self.settings.codebuff_api_url}/api/v1/chat/completions"
+        extra_headers: dict[str, str] = {}
+        if self.settings.acting_user_id:
+            # The upstream CLI gate requires the acting user id header on every
+            # chat request (freebuff-go sends it from the CLI credential store).
+            extra_headers["x-freebuff-acting-user-id"] = self.settings.acting_user_id
         request_headers = self._headers(
             json_body=True,
             user_agent=CHAT_COMPLETIONS_USER_AGENT,
+            extra=extra_headers or None,
         )
         try:
             async with self._client.stream(
@@ -847,7 +857,7 @@ class CodebuffAccountPool:
             )
         self._next_index = 0
         self._condition = asyncio.Condition()
-        self._stats_file = Path("/root/.freebuff2api/account_stats.json")
+        self._stats_file = Path(os.getenv("FREEBUFF2API_DATA_DIR") or str(Path.home() / ".freebuff2api")) / "account_stats.json"
         self._account_stats = [
             {"use_count": 0, "last_used_at": None, "last_model": None, "busy": False}
             for _ in self._accounts
@@ -858,6 +868,22 @@ class CodebuffAccountPool:
     @property
     def account_count(self) -> int:
         return len(self._accounts)
+
+    def healthy_account_count(self) -> int:
+        """Accounts not currently rate-limit-quarantined (busy is transient, not unhealthy)."""
+        now = time.time()
+        count = 0
+        for account in self._accounts:
+            blocked = any(
+                until > now
+                for until in account.rate_limit.blocked_models.values()
+            )
+            if not blocked:
+                count += 1
+        return count
+
+    def busy_account_count(self) -> int:
+        return sum(1 for account in self._accounts if account.busy)
 
     @property
     def default_client(self) -> CodebuffClient:

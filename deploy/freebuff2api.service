@@ -1,0 +1,25 @@
+[Unit]
+Description=Freebuff2API OpenAI-compatible gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=freebuff
+Group=freebuff
+WorkingDirectory=/var/lib/freebuff2api/repo
+EnvironmentFile=/var/lib/freebuff2api/repo/.env
+ExecStart=/var/lib/freebuff2api/repo/.venv/bin/freebuff2api
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/freebuff2api/data
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

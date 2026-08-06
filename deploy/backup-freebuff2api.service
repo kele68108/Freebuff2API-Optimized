@@ -1,0 +1,8 @@
+[Unit]
+Description=Freebuff2API nightly backup (data + env)
+
+[Service]
+Type=oneshot
+User=freebuff
+Group=freebuff
+ExecStart=/var/lib/freebuff2api/backup.sh
