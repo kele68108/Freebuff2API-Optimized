@@ -7,7 +7,9 @@ from typing import Optional
 import bcrypt
 import jwt
 
-DATA_DIR = Path(os.getenv("FREEBUFF2API_DATA_DIR", "/root/.freebuff2api"))
+# R1: data dir defaults to ~/.freebuff2api (never /root) so a non-root
+# service user works. Override with FREEBUFF2API_DATA_DIR.
+DATA_DIR = Path(os.getenv("FREEBUFF2API_DATA_DIR", str(Path.home() / ".freebuff2api")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = DATA_DIR / "admin_data.json"
 

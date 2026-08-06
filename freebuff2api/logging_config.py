@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import sys
@@ -7,8 +8,22 @@ from typing import Any
 
 from .config import Settings
 
-LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] request_id=%(request_id)s %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# Correlation ID propagated from the HTTP middleware into every log record
+# emitted during that request. Background tasks created with asyncio.create_task
+# inherit the caller context, so the request_id survives run-finalize paths too.
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id",
+    default="-",
+)
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_var.get()
+        return True
 
 RESET = "\033[0m"
 COLORS = {
@@ -22,6 +37,7 @@ COLORS = {
 
 class ColorFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
+        record.request_id = getattr(record, "request_id", None) or request_id_var.get()
         message = super().format(record)
         color = COLORS.get(record.levelno)
         if not color:
@@ -33,6 +49,7 @@ def configure_logging(settings: Settings) -> None:
     handler = logging.StreamHandler(sys.stdout)
     formatter_cls = ColorFormatter if settings.log_color else logging.Formatter
     handler.setFormatter(formatter_cls(LOG_FORMAT, datefmt=DATE_FORMAT))
+    handler.addFilter(RequestIdFilter())
 
     root = logging.getLogger()
     root.handlers.clear()

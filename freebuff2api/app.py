@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import logging
 from pathlib import Path
+import random
+import re
+import time
 from typing import Any, AsyncIterator
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .codebuff import (
     CodebuffAccountLease,
@@ -20,7 +24,8 @@ from .codebuff import (
     utc_now_iso,
 )
 from .config import Settings, load_settings
-from .logging_config import configure_logging, redact_headers, render_debug
+from .logging_config import configure_logging, redact_headers, render_debug, request_id_var
+from .metrics import Metrics
 from .openai_compat import (
     CompletionAccumulator,
     build_upstream_payload,
@@ -35,6 +40,110 @@ logger = logging.getLogger("freebuff2api.app")
 
 MAX_CHAT_RETRIES = 2
 
+_RATE_LIMIT_MAX_DELAY_MS = 5000
+_RATE_LIMIT_DEFAULT_DELAY_MS = 500
+
+
+def _rate_limit_delay_ms(error: CodebuffError, jitter_ms: int) -> float:
+    """Compute the sleep before retrying a rate-limited request (R5).
+
+    Honors upstream hints in priority order:
+      1. retry_after_ms (explicit, when present and > 0)
+      2. reset_at (ISO-8601) — wait until the window actually resets
+      3. 500 ms default
+    Caps at 5 s, then adds uniform jitter in [0, jitter_ms] unless jitter_ms
+    is <= 0 (env FREEBUFF_RETRY_JITTER=0 disables jitter entirely).
+    """
+    delay_ms: float = _RATE_LIMIT_DEFAULT_DELAY_MS
+    if error.retry_after_ms and error.retry_after_ms > 0:
+        delay_ms = float(error.retry_after_ms)
+    elif error.reset_at:
+        try:
+            reset_dt = datetime.fromisoformat(error.reset_at.replace("Z", "+00:00"))
+            remaining_ms = (reset_dt - datetime.now(timezone.utc)).total_seconds() * 1000.0
+            if remaining_ms > 0:
+                delay_ms = remaining_ms
+        except (ValueError, TypeError):
+            pass  # malformed reset_at -> fall through to default
+    delay_ms = min(delay_ms, _RATE_LIMIT_MAX_DELAY_MS)
+    if jitter_ms > 0:
+        delay_ms += random.uniform(0, float(jitter_ms))
+    return delay_ms
+
+_METRIC_PATH_RE = re.compile(r"/[0-9a-f]{8,}\b|/\d+\b")
+
+# Routes this app serves. Anything else (404s, scanner probes) collapses to a
+# single "{other}" label so Prometheus label cardinality stays bounded.
+_KNOWN_METRIC_PATHS = frozenset({
+    "/healthz",
+    "/livez",
+    "/readyz",
+    "/metrics",
+    "/v1/models",
+    "/v1/chat/completions",
+})
+
+
+def _metric_path(path: str) -> str:
+    """Collapse dynamic segments and unknown routes so label cardinality stays bounded."""
+    if path in _KNOWN_METRIC_PATHS:
+        return path
+    normalized = _METRIC_PATH_RE.sub("/{id}", path)
+    if normalized in _KNOWN_METRIC_PATHS:
+        return normalized
+    return "{other}"
+
+
+def _rss_bytes() -> int:
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as status_file:
+            for line in status_file:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+# R2: cache of parsed api_keys.json keyed by file mtime, so the auth hot path
+# does not re-read + re-parse the file on every request.
+_api_keys_cache: tuple[float, list[dict[str, Any]]] | None = None
+
+
+def _load_api_keys_cached(data_dir: Path) -> list[dict[str, Any]]:
+    global _api_keys_cache
+    keys_file = data_dir / "api_keys.json"
+    try:
+        mtime = keys_file.stat().st_mtime
+    except OSError:
+        _api_keys_cache = None
+        return []
+    if _api_keys_cache is not None and _api_keys_cache[0] == mtime:
+        return _api_keys_cache[1]
+    try:
+        import json
+        with open(keys_file, "r", encoding="utf-8") as handle:
+            keys = json.load(handle)
+    except Exception:
+        keys = []
+    _api_keys_cache = (mtime, keys)
+    return keys
+
+
+async def _health_ping_loop(
+    accounts: CodebuffAccountPool,
+    interval: float,
+) -> None:
+    """R7: periodic proactive account health checks (best-effort)."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await accounts.ping_health()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("health ping loop error")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -45,14 +154,90 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.accounts = accounts
     app.state.codebuff = accounts.default_client
     app.state.sessions = accounts.default_sessions
+    app.state.metrics = Metrics()
     logger.info("configured freebuff accounts count=%s", accounts.account_count)
+    health_task: asyncio.Task[None] | None = None
+    if settings.health_interval > 0:
+        health_task = asyncio.create_task(
+            _health_ping_loop(accounts, settings.health_interval)
+        )
+        logger.info("account health pinger started interval=%ss", settings.health_interval)
     try:
         yield
     finally:
+        if health_task is not None:
+            health_task.cancel()
+            try:
+                await health_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await accounts.aclose()
 
 
 app = FastAPI(title="freebuff2api", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _observability_middleware(request: Request, call_next: Any) -> Response:
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    request_id_var.set(request_id)
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration = time.perf_counter() - start
+        request.app.state.metrics.observe(
+            request.method,
+            _metric_path(request.url.path),
+            500,
+            duration,
+        )
+        raise
+    response.headers.setdefault("X-Request-ID", request_id)
+
+    if isinstance(response, StreamingResponse):
+        # Measure full SSE duration, not just time-to-first-chunk. Wrap the
+        # body iterator so the histogram reflects the real stream length.
+        original_iterator = response.body_iterator
+
+        async def _timed_stream() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in original_iterator:
+                    yield chunk
+            finally:
+                duration = time.perf_counter() - start
+                request.app.state.metrics.observe(
+                    request.method,
+                    _metric_path(request.url.path),
+                    response.status_code,
+                    duration,
+                )
+                logger.info(
+                    "http request method=%s path=%s status=%s duration_ms=%.1f stream=1",
+                    request.method,
+                    request.url.path,
+                    response.status_code,
+                    duration * 1000.0,
+                )
+
+        response.body_iterator = _timed_stream()
+        return response
+
+    duration = time.perf_counter() - start
+    request.app.state.metrics.observe(
+        request.method,
+        _metric_path(request.url.path),
+        response.status_code,
+        duration,
+    )
+    logger.info(
+        "http request method=%s path=%s status=%s duration_ms=%.1f stream=0",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration * 1000.0,
+    )
+    return response
 
 
 def _settings(request: Request) -> Settings:
@@ -83,19 +268,11 @@ def _check_local_auth(request: Request) -> None:
         if auth_header == expected:
             return
     
-    # multi-key from api_keys.json
-    import json, os
-    data_dir = Path(os.getenv("FREEBUFF2API_DATA_DIR", "/root/.freebuff2api"))
-    keys_file = data_dir / "api_keys.json"
-    if keys_file.exists():
-        try:
-            with open(keys_file, "r", encoding="utf-8") as f:
-                keys = json.load(f)
-            for k in keys:
-                if k.get("enabled", True) and auth_header == f"Bearer {k.get('key', '')}":
-                    return
-        except Exception:
-            pass
+    # multi-key from api_keys.json (R1: data dir from settings; R2: cached by mtime)
+    keys = _load_api_keys_cached(settings.data_dir)
+    for k in keys:
+        if k.get("enabled", True) and auth_header == f"Bearer {k.get('key', '')}":
+            return
     
     raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -119,6 +296,49 @@ def _error_response(error: Exception) -> JSONResponse:
 async def healthz(request: Request) -> dict[str, Any]:
     _check_local_auth(request)
     return {"status": "ok"}
+
+
+@app.get("/livez")
+async def livez() -> dict[str, Any]:
+    """Unauthenticated liveness probe — the process is up and serving."""
+    return {"status": "alive"}
+
+
+@app.get("/readyz")
+async def readyz(request: Request) -> JSONResponse:
+    """Readiness probe: 200 iff a token is configured and at least one healthy
+    upstream account exists. 503 otherwise (no token, or all quarantined)."""
+    accounts = _accounts(request)
+    healthy = accounts.healthy_account_count()
+    total = accounts.account_count
+    token_configured = bool(_settings(request).codebuff_tokens)
+    ready = token_configured and healthy >= 1
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "status": "ready" if ready else "not_ready",
+            "accounts_total": total,
+            "accounts_healthy": healthy,
+            "token_configured": token_configured,
+        },
+    )
+
+
+@app.get("/metrics")
+async def metrics(request: Request) -> Response:
+    """Prometheus text-format metrics (exposition format 0.0.4)."""
+    accounts = _accounts(request)
+    body = request.app.state.metrics.render(
+        accounts_total=accounts.account_count,
+        accounts_healthy=accounts.healthy_account_count(),
+        accounts_busy=accounts.busy_account_count(),
+        rss_bytes=_rss_bytes(),
+    )
+    return Response(
+        content=body,
+        media_type="text/plain; version=0.0.4",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/v1/models")
@@ -153,7 +373,10 @@ async def chat_completions(request: Request) -> Any:
             render_debug(body, settings.log_body_chars),
         )
 
-    messages = normalize_chat_messages(body.get("messages"))
+    messages = normalize_chat_messages(
+        body.get("messages"),
+        cli_path=settings.cli_path,
+    )
     last_error: CodebuffError | None = None
 
     for attempt in range(MAX_CHAT_RETRIES + 1):
@@ -175,6 +398,7 @@ async def chat_completions(request: Request) -> Any:
                 client_id=settings.client_id,
                 trace_session_id=trace_session_id,
                 upstream_model_id=model_config.upstream_id,
+                cli_path=settings.cli_path,
             )
             if settings.debug:
                 logger.debug(
@@ -228,12 +452,15 @@ async def chat_completions(request: Request) -> Any:
             if error.is_rate_limit and attempt < MAX_CHAT_RETRIES:
                 if lease is not None:
                     lease.mark_rate_limited(model, error.reset_at)
+                delay_ms = _rate_limit_delay_ms(error, settings.retry_jitter_ms)
                 logger.warning(
-                    "rate limit on attempt %s/%s, retrying: %s",
+                    "rate limit on attempt %s/%s, retrying in %.0f ms: %s",
                     attempt + 1,
                     MAX_CHAT_RETRIES,
+                    delay_ms,
                     error,
                 )
+                await asyncio.sleep(delay_ms / 1000.0)
             last_error = error
             if error.is_rate_limit and attempt < MAX_CHAT_RETRIES:
                 continue
@@ -252,6 +479,38 @@ async def chat_completions(request: Request) -> Any:
     )
 
 
+async def _sse_keepalive(
+    lines: AsyncIterator[str],
+    idle_seconds: float,
+) -> AsyncIterator[str | None]:
+    """R10: emit a keepalive marker (None) when the upstream stream is idle.
+
+    Wraps the upstream line iterator with an idle deadline; if no line arrives
+    within idle_seconds, yields None so the caller can send a ": ping" SSE
+    comment. Prevents client/proxy timeouts on long generations.
+
+    IMPORTANT: uses a persistent task + asyncio.wait (NOT wait_for on
+    __anext__) — wait_for cancels the inner generator on timeout, which would
+    kill the live upstream stream. The read task survives timeouts and the
+    generator is only closed on StopAsyncIteration or outer cancellation.
+    """
+    next_task = asyncio.ensure_future(lines.__anext__())
+    try:
+        while True:
+            done, _ = await asyncio.wait({next_task}, timeout=idle_seconds)
+            if next_task not in done:
+                yield None
+                continue
+            try:
+                line = next_task.result()
+            except StopAsyncIteration:
+                return
+            next_task = asyncio.ensure_future(lines.__anext__())
+            yield line
+    finally:
+        next_task.cancel()
+
+
 async def _stream_openai_chunks(
     request: Request,
     payload: dict[str, Any],
@@ -264,8 +523,15 @@ async def _stream_openai_chunks(
     message_id: str | None = None
     client = client or (account_lease.client if account_lease else _client(request))
     settings = _settings(request)
+    upstream_lines = client.chat_events(payload)
+    if settings.sse_keepalive_seconds > 0:
+        upstream_lines = _sse_keepalive(upstream_lines, settings.sse_keepalive_seconds)
     try:
-        async for line in client.chat_events(payload):
+        async for line in upstream_lines:
+            if line is None:
+                # R10: idle keepalive comment — transparent to SSE parsers.
+                yield b": ping\n\n"
+                continue
             data = decode_sse_data(line)
             if data is None:
                 continue

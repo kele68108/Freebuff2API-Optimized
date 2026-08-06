@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
@@ -22,11 +23,30 @@ class Settings:
     codebuff_token: str | None
     local_api_key: str | None
     codebuff_base_url: str = "https://www.codebuff.com"
+    acting_user_id: str | None = None
+    cli_path: str = ""
     zeroclick_base_url: str = "https://zeroclick.dev"
     session_id: str = ""
     client_id: str = ""
     ad_providers: tuple[str, ...] = ("gravity", "zeroclick")
     request_timeout: float = 60.0
+    retry_jitter_ms: int = 250
+    # R1: single source of truth for the data dir. Defaults to ~/.freebuff2api
+    # (NOT /root) so a non-root service user works out of the box.
+    data_dir: Path = field(default_factory=lambda: Path.home() / ".freebuff2api")
+    # R3: env-tunable httpx connection pool limits.
+    httpx_max_connections: int = 100
+    httpx_max_keepalive: int = 20
+    httpx_keepalive_expiry: float = 30.0
+    httpx_read_timeout: float = 300.0
+    # R4: bounded concurrency — max number of requests waiting on a free
+    # account before failing fast with 503. 0 = unlimited (old behaviour).
+    max_waiters: int = 64
+    # R7: proactive account health pinger.
+    health_interval: float = 60.0
+    health_cooldown: float = 300.0
+    # R10: SSE keepalive comment cadence (0 = disabled).
+    sse_keepalive_seconds: float = 15.0
     debug: bool = False
     log_level: str = "INFO"
     log_body_chars: int = 2000
@@ -90,19 +110,45 @@ def _api_base_url() -> str:
     )
 
 
+def _float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def load_settings() -> Settings:
     debug = _bool("FREEBUFF_DEBUG", False)
     log_level = "DEBUG" if debug else os.getenv("FREEBUFF_LOG_LEVEL", "INFO")
     color_default = os.getenv("NO_COLOR") is None
+    env_data_dir = os.getenv("FREEBUFF2API_DATA_DIR")
+    data_dir = Path(env_data_dir) if env_data_dir else Path.home() / ".freebuff2api"
     return Settings(
         codebuff_token=os.getenv("FREEBUFF_TOKEN") or os.getenv("CODEBUFF_TOKEN"),
         local_api_key=os.getenv("FREEBUFF_API_KEY") or os.getenv("OPENAI_API_KEY"),
         codebuff_base_url=_api_base_url(),
+        acting_user_id=os.getenv("FREEBUFF_ACTING_USER_ID") or None,
+        cli_path=os.getenv("FREEBUFF_CLI_PATH") or str(
+            Path.home() / ".config" / "manicode" / "freebuff"
+        ),
         zeroclick_base_url=os.getenv("ZEROCLICK_BASE_URL", "https://zeroclick.dev"),
         session_id=os.getenv("FREEBUFF_SESSION_ID", str(uuid.uuid4())),
         client_id=os.getenv("FREEBUFF_CLIENT_ID", uuid.uuid4().hex[:11]),
         ad_providers=_csv("FREEBUFF_AD_PROVIDERS", "gravity,zeroclick"),
         request_timeout=float(os.getenv("FREEBUFF_TIMEOUT", "60")),
+        retry_jitter_ms=_int("FREEBUFF_RETRY_JITTER", 250),
+        data_dir=data_dir,
+        httpx_max_connections=_int("FREEBUFF_HTTPX_MAX_CONNECTIONS", 100),
+        httpx_max_keepalive=_int("FREEBUFF_HTTPX_KEEPALIVE", 20),
+        httpx_keepalive_expiry=_float_env("FREEBUFF_HTTPX_KEEPALIVE_EXPIRY", 30.0),
+        httpx_read_timeout=_float_env("FREEBUFF_HTTPX_READ_TIMEOUT", 300.0),
+        max_waiters=_int("FREEBUFF_MAX_WAITERS", 64),
+        health_interval=_float_env("FREEBUFF_HEALTH_INTERVAL", 60.0),
+        health_cooldown=_float_env("FREEBUFF_HEALTH_COOLDOWN", 300.0),
+        sse_keepalive_seconds=_float_env("FREEBUFF_SSE_KEEPALIVE", 15.0),
         debug=debug,
         log_level=log_level,
         log_body_chars=_int("FREEBUFF_LOG_BODY_CHARS", 0 if debug else 2000),
